@@ -14,6 +14,8 @@ import json
 import base64
 import ipaddress
 import bisect
+import time
+import math
 from collections import defaultdict
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -763,19 +765,16 @@ def create_cidr_filtered_configs():
         "217.28.224.0/20"
     ]
     
-    # Преобразуем CIDR в отсортированные несвязанные интервалы (int start, int end)
+    # --- подготовка CIDR-интервалов (int start/end) ---
     cidr_nets = []
     for cidr_str in sidr_ranges:
         try:
             net = ipaddress.ip_network(cidr_str, strict=False)
-            start = int(net.network_address)
-            end = int(net.broadcast_address)
-            cidr_nets.append((start, end))
+            cidr_nets.append((int(net.network_address), int(net.broadcast_address)))
         except Exception as e:
             log(f"⚠️ Ошибка при парсинге CIDR {cidr_str}: {e}")
 
     if not cidr_nets:
-        # если CIDR-диапазоны не заданы — создаём пустой файл
         local_path_27 = "githubmirror/27.txt"
         try:
             with open(local_path_27, "w", encoding="utf-8") as f:
@@ -785,7 +784,7 @@ def create_cidr_filtered_configs():
             log(f"⚠️ Ошибка при создании {local_path_27}: {e}")
         return local_path_27
 
-    # Сливаем перекрывающиеся интерваллы и сортируем по началу
+    # объединяем перекрывающиеся интервалы
     cidr_nets.sort(key=lambda x: x[0])
     merged = []
     for s, e in cidr_nets:
@@ -798,77 +797,147 @@ def create_cidr_filtered_configs():
     starts = [iv[0] for iv in merged]
     ends = [iv[1] for iv in merged]
 
-    # Регулярка для быстрого опознавания IPv4 — избегаем дорогостоящих исключений
+    # быстрый фильтр для IPv4 (избегаем частых исключений)
     ipv4_re = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
 
-    seen_full = set()
-    seen_hostport = set()
-    unique_configs = []
-
-    total_checked = 0
-    matches_found = 0
-
+    # Подсчёт общего числа строк — нужен для прогресс-бара (быстрая проходка)
+    total_lines = 0
     for i in range(1, 26):
-        local_path = f"githubmirror/{i}.txt"
-        if os.path.exists(local_path):
+        p = f"githubmirror/{i}.txt"
+        if os.path.exists(p):
             try:
-                with open(local_path, "r", encoding="utf-8") as file:
-                    for line in file:
-                        total_checked += 1
-                        if total_checked % 10000 == 0:
-                            log(f"🔎 Проверено строк: {total_checked}, найдено совпадений: {matches_found}")
-
-                        line = line.strip()
-                        if not line:
-                            continue
-
-                        hostport = _extract_host_port(line)
-                        if not hostport:
-                            continue
-
-                        host = hostport[0]
-
-                        # Сначала быстрый фильтр по форме IPv4
-                        if not ipv4_re.match(host):
-                            continue
-
-                        try:
-                            ip = ipaddress.ip_address(host)
-                        except Exception:
-                            # если всё же невалидный IP — пропускаем
-                            continue
-
-                        ip_int = int(ip)
-
-                        # Бинарный поиск по интервалам
-                        idx = bisect.bisect_right(starts, ip_int) - 1
-                        if idx < 0 or ends[idx] < ip_int:
-                            continue
-
-                        # Попадание в диапазон — учитываем и делаем дедуп
-                        c = line
-                        if c in seen_full:
-                            continue
-                        seen_full.add(c)
-
-                        hp = _extract_host_port(c)
-                        if hp:
-                            key = f"{hp[0].lower()}:{hp[1]}"
-                            if key in seen_hostport:
-                                continue
-                            seen_hostport.add(key)
-
-                        unique_configs.append(c)
-                        matches_found += 1
+                # быстрый подсчёт — читаем блоками
+                with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+                    for _ in f:
+                        total_lines += 1
             except Exception as e:
-                log(f"⚠️ Ошибка при чтении файла {local_path}: {e}")
+                log(f"⚠️ Ошибка при подсчёте строк в {p}: {e}")
 
+    if total_lines == 0:
+        # нет данных — создаём пустой файл
+        local_path_27 = "githubmirror/27.txt"
+        try:
+            with open(local_path_27, "w", encoding="utf-8") as f:
+                f.write("")
+            log(f"📁 Создан файл {local_path_27} (нет строк для проверки)")
+        except Exception as e:
+            log(f"⚠️ Ошибка при создании {local_path_27}: {e}")
+        return local_path_27
+
+    # Многопоточная обработка файлов — каждый воркер обрабатывает один файл
+    max_workers = min(8, (os.cpu_count() or 4))
+    processed = 0
+    processed_lock = threading.Lock()
+
+    results_lock = threading.Lock()
+    unique_configs = []
+    global_seen_full = set()
+    global_seen_hostport = set()
+
+    start_time = time.time()
+
+    def format_progress(p, total, start_t):
+        pct = (p / total) * 100 if total else 100.0
+        elapsed = time.time() - start_t
+        speed = p / elapsed if elapsed > 0 else 0
+        eta = (total - p) / speed if speed > 0 else float('inf')
+        eta_s = f"{int(eta)}s" if math.isfinite(eta) else "?"
+        return f"{p}/{total} ({pct:.1f}%) speed={int(speed)}/s elapsed={int(elapsed)}s eta={eta_s}"
+
+    def process_file(file_index: int):
+        nonlocal processed
+        local_seen_full = set()
+        local_seen_hostport = set()
+        local_matches = []
+
+        p = f"githubmirror/{file_index}.txt"
+        try:
+            with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    with processed_lock:
+                        processed += 1
+                        if processed % 5000 == 0 or processed == total_lines:
+                            # печатаем прогресс поверх строки
+                            print('\r[SIDR] ' + format_progress(processed, total_lines, start_time), end='', flush=True)
+
+                    if not line:
+                        continue
+
+                    hostport = _extract_host_port(line)
+                    if not hostport:
+                        continue
+                    host = hostport[0]
+
+                    # только IPv4-формат
+                    if not ipv4_re.match(host):
+                        continue
+
+                    try:
+                        ip = ipaddress.ip_address(host)
+                    except Exception:
+                        continue
+
+                    ip_int = int(ip)
+                    idx = bisect.bisect_right(starts, ip_int) - 1
+                    if idx < 0 or ends[idx] < ip_int:
+                        continue
+
+                    # локальная дедупликация
+                    if line in local_seen_full:
+                        continue
+                    local_seen_full.add(line)
+
+                    hp = _extract_host_port(line)
+                    if hp:
+                        key = f"{hp[0].lower()}:{hp[1]}"
+                        if key in local_seen_hostport:
+                            continue
+                        local_seen_hostport.add(key)
+
+                    local_matches.append(line)
+        except FileNotFoundError:
+            return []
+        except Exception as e:
+            log(f"⚠️ Ошибка при обработке {p}: {e}")
+            return []
+
+        # Слияние локальных результатов в глобальные множества под блокировкой
+        with results_lock:
+            for c in local_matches:
+                if c in global_seen_full:
+                    continue
+                hp = _extract_host_port(c)
+                if hp:
+                    key = f"{hp[0].lower()}:{hp[1]}"
+                    if key in global_seen_hostport:
+                        continue
+                    global_seen_hostport.add(key)
+                global_seen_full.add(c)
+                unique_configs.append(c)
+
+        return []
+
+    # Запускаем воркеры
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(process_file, i) for i in range(1, 26)]
+        # ждём завершения и печатаем завершающий прогресс
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                log(f"⚠️ Ошибка в worker: {e}")
+
+    # Финальный прогресс-вывод
+    print('\r[SIDR] ' + format_progress(processed, total_lines, start_time))
+
+    # Записываем результаты
     local_path_27 = "githubmirror/27.txt"
     try:
         with open(local_path_27, "w", encoding="utf-8") as file:
             for config in unique_configs:
                 file.write(config + "\n")
-        log(f"📁 Создан файл {local_path_27} с {len(unique_configs)} конфигами, попавшими в CIDR-диапазоны (проверено строк: {total_checked})")
+        log(f"📁 Создан файл {local_path_27} с {len(unique_configs)} конфигами, попавшими в CIDR-диапазоны (проверено строк: {processed})")
     except Exception as e:
         log(f"⚠️ Ошибка при сохранении {local_path_27}: {e}")
 
