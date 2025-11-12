@@ -616,7 +616,7 @@ def main(dry_run: bool = False):
 
         download_futures = [download_pool.submit(download_and_save, i) for i in range(len(URLS))]
         upload_futures: list[concurrent.futures.Future] = []
-
+    
         for future in concurrent.futures.as_completed(download_futures):
             result = future.result()
             if result:
