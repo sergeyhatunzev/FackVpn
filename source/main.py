@@ -11,6 +11,7 @@ import threading
 import re
 import json
 import base64
+import ipaddress
 from collections import defaultdict
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -102,6 +103,9 @@ LOCAL_PATHS = [f"githubmirror/{i+1}.txt" for i in range(len(URLS))]
 # Добавляем 26-й файл в пути
 REMOTE_PATHS.append("githubmirror/26.txt")
 LOCAL_PATHS.append("githubmirror/26.txt")
+# Добавляем 27-й файл (SIDR — фильтрация по CIDR из githubmirror/7.txt)
+REMOTE_PATHS.append("githubmirror/27.txt")
+LOCAL_PATHS.append("githubmirror/27.txt")
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -173,6 +177,49 @@ def extract_source_name(url: str) -> str:
     except:
         return "Источник"
 
+
+def _extract_host_port(line: str):
+    """Пробует извлечь host и port из строки конфига.
+    Поддерживает несколько форматов: vmess://<base64-json>, обычные URI с схемой,
+    а также простые вхождения host:port или ip:port через regex.
+    Возвращает кортеж (host, port) или None.
+    """
+    if not line:
+        return None
+
+    # vmess://<base64>
+    try:
+        if line.lower().startswith("vmess://"):
+            payload = line[len("vmess://"):]
+            # корректируем паддинг и декодируем
+            try:
+                payload_bytes = base64.b64decode(payload + '=' * (-len(payload) % 4))
+                decoded = payload_bytes.decode('utf-8', errors='ignore')
+                j = json.loads(decoded)
+                host = j.get('add') or j.get('host') or j.get('ip')
+                port = j.get('port')
+                if host and port:
+                    return host, str(port)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Попытка распарсить как URI (trojan://, vless://, http:// и т.д.)
+    try:
+        parsed = urllib.parse.urlparse(line if '://' in line else '//' + line)
+        if parsed.hostname and parsed.port:
+            return parsed.hostname, str(parsed.port)
+    except Exception:
+        pass
+
+    # Ищем явное вхождение host:port или ip:port
+    m = re.search(r'(?P<host>(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9\-_.]+):(?P<port>\d{1,5})', line)
+    if m:
+        return m.group('host'), m.group('port')
+
+    return None
+
 def update_readme_table():
     """Обновляет таблицу в README.md с информацией о времени последнего обновления"""
     try:
@@ -195,18 +242,25 @@ def update_readme_table():
         table_header = "| № | Файл | Источник | Время | Дата |\n|--|--|--|--|--|"
         table_rows = []
         
-        for i, (remote_path, url) in enumerate(zip(REMOTE_PATHS, URLS + [""]), 1):
+        for i, remote_path in enumerate(REMOTE_PATHS, 1):
             filename = f"{i}.txt"
-            
+
             # Формируем ссылку на raw-файл в репозитории
             raw_file_url = f"https://github.com/{REPO_NAME}/raw/refs/heads/main/githubmirror/{i}.txt"
-            
-            if i <= 25:
+
+            # Источник: для первых N записей — URL из списка, затем специальные описания для 26 и 27
+            if i <= len(URLS):
+                url = URLS[i-1]
                 source_name = extract_source_name(url)
                 source_column = f"[{source_name}]({url})"
-            else:
-                # Для 26-го файла создаем ссылку на сам файл с текстом "Обход SNI белых списков"
+            elif i == len(URLS) + 1:
                 source_name = "Обход SNI белых списков"
+                source_column = f"[{source_name}]({raw_file_url})"
+            elif i == len(URLS) + 2:
+                source_name = "SIDR — фильтрация по CIDR"
+                source_column = f"[{source_name}]({raw_file_url})"
+            else:
+                source_name = "Источник"
                 source_column = f"[{source_name}]({raw_file_url})"
             
             # Проверяем, был ли файл обновлен в этом запуске
@@ -528,47 +582,7 @@ def create_filtered_configs():
             except Exception as e:
                 log(f"⚠️ Ошибка при чтении файла {local_path}: {e}")
 
-    def _extract_host_port(line: str):
-        """Пробует извлечь host и port из строки конфига.
-        Поддерживает несколько форматов: vmess://<base64-json>, обычные URI с схемой,
-        а также простые вхождения host:port или ip:port через regex.
-        Возвращает кортеж (host, port) или None.
-        """
-        if not line:
-            return None
-
-        # vmess://<base64>
-        try:
-            if line.lower().startswith("vmess://"):
-                payload = line[len("vmess://"):]
-                # корректируем паддинг и декодируем
-                try:
-                    payload_bytes = base64.b64decode(payload + '=' * (-len(payload) % 4))
-                    decoded = payload_bytes.decode('utf-8', errors='ignore')
-                    j = json.loads(decoded)
-                    host = j.get('add') or j.get('host') or j.get('ip')
-                    port = j.get('port')
-                    if host and port:
-                        return host, str(port)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Попытка распарсить как URI (trojan://, vless://, http:// и т.д.)
-        try:
-            parsed = urllib.parse.urlparse(line if '://' in line else '//' + line)
-            if parsed.hostname and parsed.port:
-                return parsed.hostname, str(parsed.port)
-        except Exception:
-            pass
-
-        # Ищем явное вхождение host:port или ip:port
-        m = re.search(r'(?P<host>(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9\-_.]+):(?P<port>\d{1,5})', line)
-        if m:
-            return m.group('host'), m.group('port')
-
-        return None
+    # Используется модульная функция _extract_host_port, см. определение выше
 
     # Удаляем дубликаты: сначала проверяем полное совпадение строки, затем
     # считаем дубликатом конфиг с тем же host:port (ip:port)
@@ -607,6 +621,214 @@ def create_filtered_configs():
 
     return local_path_26
 
+def create_cidr_filtered_configs():
+    """Создаёт 27-й файл с конфигами, у которых хост или IP попадает в указанные CIDR-диапазоны (SIDR)
+    Логика:
+    - используются встроенные CIDR-диапазоны (список ниже)
+    - для каждого конфига (файлы 1..25) пробуем извлечь host/ip через _extract_host_port
+    - проверяем принадлежность IP в любой CIDR (ipaddress.ip_network)
+    - удаляем дубликаты аналогично 26-му файлу
+    """
+    sidr_ranges = [
+        "5.61.16.0/21",
+        "5.61.232.0/21",
+        "5.101.40.0/22",
+        "5.181.60.0/23",
+        "5.181.62.0/24",
+        "5.181.63.0/24",
+        "5.188.140.0/22",
+        "31.177.104.0/22",
+        "37.139.32.0/22",
+        "37.139.40.0/22",
+        "44.32.144.0/23",
+        "45.84.128.0/22",
+        "45.136.20.0/22",
+        "46.245.234.0/24",
+        "62.217.160.0/20",
+        "79.137.140.0/24",
+        "79.137.142.0/24",
+        "79.137.157.0/24",
+        "79.137.174.0/23",
+        "79.137.240.0/21",
+        "83.166.232.0/21",
+        "83.166.248.0/21",
+        "83.217.216.0/22",
+        "83.222.28.0/22",
+        "84.23.52.0/22",
+        "85.192.32.0/22",
+        "85.198.107.0/24",
+        "87.239.104.0/21",
+        "87.242.112.0/22",
+        "89.208.84.0/22",
+        "89.208.196.0/22",
+        "89.208.208.0/22",
+        "89.208.216.0/21",
+        "89.208.228.0/22",
+        "89.221.228.0/22",
+        "89.221.232.0/24",
+        "89.221.233.0/24",
+        "89.221.234.0/24",
+        "89.221.235.0/24",
+        "89.221.236.0/22",
+        "90.156.148.0/22",
+        "90.156.212.0/22",
+        "90.156.216.0/22",
+        "90.156.232.0/21",
+        "91.219.224.0/22",
+        "91.231.135.0/24",
+        "94.100.176.0/20",
+        "94.139.244.0/22",
+        "95.163.34.0/23",
+        "95.163.36.0/22",
+        "95.163.40.0/21",
+        "95.163.48.0/20",
+        "95.163.133.0/24",
+        "95.163.159.0/24",
+        "95.163.180.0/22",
+        "95.163.208.0/21",
+        "95.163.216.0/22",
+        "95.163.248.0/21",
+        "109.120.180.0/22",
+        "109.120.188.0/22",
+        "128.140.168.0/21",
+        "146.185.208.0/22",
+        "146.185.240.0/22",
+        "176.112.168.0/21",
+        "178.22.88.0/23",
+        "178.22.94.0/23",
+        "178.237.16.0/20",
+        "185.5.136.0/22",
+        "185.6.244.0/22",
+        "185.16.148.0/22",
+        "185.16.244.0/22",
+        "185.86.144.0/22",
+        "185.100.104.0/22",
+        "185.130.112.0/22",
+        "185.131.70.0/23",
+        "185.180.200.0/22",
+        "185.187.63.0/24",
+        "185.226.52.0/22",
+        "185.241.192.0/22",
+        "188.93.56.0/21",
+        "193.203.40.0/22",
+        "194.186.63.0/24",
+        "195.211.22.0/24",
+        "195.211.23.0/24",
+        "195.218.168.0/24",
+        "195.218.190.0/23",
+        "212.111.84.0/22",
+        "212.233.72.0/21",
+        "212.233.88.0/21",
+        "212.233.96.0/22",
+        "212.233.120.0/22",
+        "213.219.212.0/22",
+        "217.16.16.0/20",
+        "217.20.144.0/20",
+        "217.69.128.0/20",
+        "217.174.188.0/22",
+        "31.44.8.0/21",
+        "37.230.172.0/22",
+        "37.230.188.0/22",
+        "45.133.96.0/22",
+        "46.21.244.0/22",
+        "51.250.0.0/17",
+        "62.84.112.0/20",
+        "84.201.128.0/18",
+        "84.252.128.0/20",
+        "89.169.128.0/18",
+        "89.223.9.0/24",
+        "89.223.20.0/24",
+        "89.232.188.0/22",
+        "92.255.1.0/24",
+        "92.255.3.0/24",
+        "93.77.160.0/19",
+        "94.126.204.0/22",
+        "94.139.248.0/22",
+        "130.193.32.0/19",
+        "158.160.0.0/16",
+        "178.154.192.0/18",
+        "185.206.164.0/22",
+        "188.72.103.0/24",
+        "188.72.104.0/23",
+        "193.32.216.0/22",
+        "194.247.51.0/24",
+        "213.165.192.0/19",
+        "217.28.224.0/20"
+    ]
+    
+    cidrs = []
+    for cidr_str in sidr_ranges:
+        try:
+            cidrs.append(ipaddress.ip_network(cidr_str, strict=False))
+        except Exception as e:
+            log(f"⚠️ Ошибка при парсинге CIDR {cidr_str}: {e}")
+
+    if not cidrs:
+        # если CIDR-диапазоны не заданы — создаём пустой файл
+        local_path_27 = "githubmirror/27.txt"
+        try:
+            with open(local_path_27, "w", encoding="utf-8") as f:
+                f.write("")
+            log(f"📁 Создан файл {local_path_27} (SIDR-диапазоны отсутствуют)")
+        except Exception as e:
+            log(f"⚠️ Ошибка при создании {local_path_27}: {e}")
+        return local_path_27
+
+    all_configs = []
+    for i in range(1, 26):
+        local_path = f"githubmirror/{i}.txt"
+        if os.path.exists(local_path):
+            try:
+                with open(local_path, "r", encoding="utf-8") as file:
+                    for line in file:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        hostport = _extract_host_port(line)
+                        if hostport:
+                            host = hostport[0]
+                            # пробуем распарсить как IP, иначе попробуем резолв (но резолв не делаем — только IP)
+                            try:
+                                ip = ipaddress.ip_address(host)
+                                if any(ip in net for net in cidrs):
+                                    all_configs.append(line)
+                            except Exception:
+                                # host — не IP, пропускаем (у нас SIDR — по IP-диапазонам)
+                                continue
+            except Exception as e:
+                log(f"⚠️ Ошибка при чтении файла {local_path}: {e}")
+
+    # Удаляем дубликаты аналогично 26-му
+    seen_full = set()
+    seen_hostport = set()
+    unique_configs = []
+
+    for cfg in all_configs:
+        c = cfg.strip()
+        if not c:
+            continue
+        if c in seen_full:
+            continue
+        seen_full.add(c)
+        hostport = _extract_host_port(c)
+        if hostport:
+            key = f"{hostport[0].lower()}:{hostport[1]}"
+            if key in seen_hostport:
+                continue
+            seen_hostport.add(key)
+        unique_configs.append(c)
+
+    local_path_27 = "githubmirror/27.txt"
+    try:
+        with open(local_path_27, "w", encoding="utf-8") as file:
+            for config in unique_configs:
+                file.write(config + "\n")
+        log(f"📁 Создан файл {local_path_27} с {len(unique_configs)} конфигами, попавшими в CIDR-диапазоны")
+    except Exception as e:
+        log(f"⚠️ Ошибка при сохранении {local_path_27}: {e}")
+
+    return local_path_27
+
 def main(dry_run: bool = False):
     max_workers_download = min(DEFAULT_MAX_WORKERS, max(1, len(URLS)))
     max_workers_upload = max(2, min(6, len(URLS)))
@@ -616,7 +838,7 @@ def main(dry_run: bool = False):
 
         download_futures = [download_pool.submit(download_and_save, i) for i in range(len(URLS))]
         upload_futures: list[concurrent.futures.Future] = []
-    
+
         for future in concurrent.futures.as_completed(download_futures):
             result = future.result()
             if result:
@@ -632,9 +854,13 @@ def main(dry_run: bool = False):
     # Создаем 26-й файл с отфильтрованными конфигами
     local_path_26 = create_filtered_configs()
     
-    # Загружаем 26-й файл в GitHub
+    # Создаем 27-й файл (CIDR/SIDR)
+    local_path_27 = create_cidr_filtered_configs()
+
+    # Загружаем 26-й и 27-й файлы в GitHub
     if not dry_run:
         upload_to_github(local_path_26, "githubmirror/26.txt")
+        upload_to_github(local_path_27, "githubmirror/27.txt")
 
     # Обновляем таблицу в README.md после всех загрузок
     if not dry_run and updated_files:
