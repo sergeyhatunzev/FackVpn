@@ -767,71 +767,132 @@ def create_cidr_filtered_configs():
         try:
             cidrs.append(ipaddress.ip_network(cidr_str, strict=False))
         except Exception as e:
-            log(f"⚠️ Ошибка при парсинге CIDR {cidr_str}: {e}")
+            log(f"githubmirror/27.txt — ⚠️ Ошибка при парсинге CIDR {cidr_str}: {e}")
 
+    local_path_27 = "githubmirror/27.txt"
     if not cidrs:
         # если CIDR-диапазоны не заданы — создаём пустой файл
-        local_path_27 = "githubmirror/27.txt"
         try:
             with open(local_path_27, "w", encoding="utf-8") as f:
                 f.write("")
-            log(f"📁 Создан файл {local_path_27} (SIDR-диапазоны отсутствуют)")
+            log(f"githubmirror/27.txt — 📁 Создан файл {local_path_27} (SIDR-диапазоны отсутствуют)")
         except Exception as e:
-            log(f"⚠️ Ошибка при создании {local_path_27}: {e}")
+            log(f"githubmirror/27.txt — ⚠️ Ошибка при создании {local_path_27}: {e}")
         return local_path_27
 
-    all_configs = []
+    # Сначала считаем общее количество строк во всех существующих файлах для корректного прогресс-бара
+    total_lines = 0
+    files_to_scan = []
     for i in range(1, 26):
         local_path = f"githubmirror/{i}.txt"
         if os.path.exists(local_path):
             try:
-                with open(local_path, "r", encoding="utf-8") as file:
-                    for line in file:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        hostport = _extract_host_port(line)
-                        if hostport:
-                            host = hostport[0]
-                            # пробуем распарсить как IP, иначе попробуем резолв (но резолв не делаем — только IP)
-                            try:
-                                ip = ipaddress.ip_address(host)
-                                if any(ip in net for net in cidrs):
-                                    all_configs.append(line)
-                            except Exception:
-                                # host — не IP, пропускаем (у нас SIDR — по IP-диапазонам)
-                                continue
+                with open(local_path, "r", encoding="utf-8") as f:
+                    cnt = sum(1 for _ in f)
+                total_lines += cnt
+                files_to_scan.append((i, local_path, cnt))
             except Exception as e:
-                log(f"⚠️ Ошибка при чтении файла {local_path}: {e}")
+                log(f"githubmirror/27.txt — ⚠️ Ошибка при подсчёте строк в {local_path}: {e}")
+
+    if not files_to_scan:
+        try:
+            with open(local_path_27, "w", encoding="utf-8") as f:
+                f.write("")
+            log(f"githubmirror/27.txt — 📁 Создан файл {local_path_27} (нет исходных файлов для анализа)")
+        except Exception as e:
+            log(f"githubmirror/27.txt — ⚠️ Ошибка при создании {local_path_27}: {e}")
+        return local_path_27
+
+    log(f"githubmirror/27.txt — 🔎 Начинаем сканирование {len(files_to_scan)} файлов, примерно {total_lines} строк(и) всего")
+
+    import time
+
+    all_configs = []
+    processed = 0
+    matches = 0
+    read_errors = 0
+
+    # прогресс-бар: обновляем не чаще, чем каждые 0.5 секунды или каждые 200 строк
+    last_update = time.time()
+    update_interval = 0.5
+    update_lines = 200
+
+    for file_idx, path, cnt in files_to_scan:
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                for line in file:
+                    processed += 1
+                    line = line.strip()
+                    if not line:
+                        continue
+                    hostport = _extract_host_port(line)
+                    if hostport:
+                        host = hostport[0]
+                        try:
+                            ip = ipaddress.ip_address(host)
+                            if any(ip in net for net in cidrs):
+                                all_configs.append(line)
+                                matches += 1
+                        except Exception:
+                            # host — не IP, пропускаем
+                            pass
+
+                    # Обновляем прогресс-бар
+                    now = time.time()
+                    if (processed % update_lines == 0) or (now - last_update >= update_interval):
+                        pct = (processed / total_lines) * 100 if total_lines else 100
+                        bar_len = 30
+                        filled = int(bar_len * processed // total_lines) if total_lines else bar_len
+                        bar = '█' * filled + '-' * (bar_len - filled)
+                        print(f"[27] [{bar}] {processed}/{total_lines} ({pct:.1f}%) — matches: {matches}", end='\r', flush=True)
+                        last_update = now
+
+        except Exception as e:
+            read_errors += 1
+            short_msg = str(e)
+            if len(short_msg) > 200:
+                short_msg = short_msg[:200] + "…"
+            log(f"githubmirror/27.txt — ⚠️ Ошибка при чтении файла {path}: {short_msg}")
+
+    # Финальный прогресс
+    print()  # перенос строки после прогресс-бара
+    log(f"githubmirror/27.txt — 🔎 Сканирование завершено: прочитано {processed} строк, найдено {matches} совпадений, ошибок чтения {read_errors}")
 
     # Удаляем дубликаты аналогично 26-му
     seen_full = set()
     seen_hostport = set()
     unique_configs = []
+    duplicates_full = 0
+    duplicates_hostport = 0
 
     for cfg in all_configs:
         c = cfg.strip()
         if not c:
             continue
         if c in seen_full:
+            duplicates_full += 1
             continue
         seen_full.add(c)
         hostport = _extract_host_port(c)
         if hostport:
             key = f"{hostport[0].lower()}:{hostport[1]}"
             if key in seen_hostport:
+                duplicates_hostport += 1
                 continue
             seen_hostport.add(key)
         unique_configs.append(c)
 
-    local_path_27 = "githubmirror/27.txt"
     try:
         with open(local_path_27, "w", encoding="utf-8") as file:
             for config in unique_configs:
                 file.write(config + "\n")
-        log(f"📁 Создан файл {local_path_27} с {len(unique_configs)} конфигами, попавшими в CIDR-диапазоны")
+        log(f"githubmirror/27.txt — 📁 Создан файл {local_path_27} с {len(unique_configs)} конфигами, попавшими в CIDR-диапазоны")
+        log(f"githubmirror/27.txt — ℹ️ Статистика: найдено={matches}, уникальных={len(unique_configs)}, дубликатов(строк)={duplicates_full}, дубликатов(host:port)={duplicates_hostport}")
     except Exception as e:
-        log(f"⚠️ Ошибка при сохранении {local_path_27}: {e}")
+        short_msg = str(e)
+        if len(short_msg) > 200:
+            short_msg = short_msg[:200] + "…"
+        log(f"githubmirror/27.txt — ⚠️ Ошибка при сохранении {local_path_27}: {short_msg}")
 
     return local_path_27
 
