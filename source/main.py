@@ -14,6 +14,7 @@ import base64
 from collections import defaultdict
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import ipaddress
 
 # -------------------- ЛОГИРОВАНИЕ --------------------
 LOGS_BY_FILE: dict[int, list[str]] = defaultdict(list)
@@ -99,9 +100,11 @@ URLS = [
 REMOTE_PATHS = [f"githubmirror/{i+1}.txt" for i in range(len(URLS))]
 LOCAL_PATHS = [f"githubmirror/{i+1}.txt" for i in range(len(URLS))]
 
-# Добавляем 26-й файл в пути
+# Добавляем 26-й и 27-й файлы в пути
 REMOTE_PATHS.append("githubmirror/26.txt")
 LOCAL_PATHS.append("githubmirror/26.txt")
+REMOTE_PATHS.append("githubmirror/27.txt")
+LOCAL_PATHS.append("githubmirror/27.txt")
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -183,7 +186,7 @@ def update_readme_table():
         except GithubException as e:
             if e.status == 404:
                 log("❌ README.md не найден в репозитории")
-                return
+ Ara                return
             else:
                 log(f"⚠️ Ошибка при получении README.md: {e}")
                 return
@@ -195,7 +198,7 @@ def update_readme_table():
         table_header = "| № | Файл | Источник | Время | Дата |\n|--|--|--|--|--|"
         table_rows = []
         
-        for i, (remote_path, url) in enumerate(zip(REMOTE_PATHS, URLS + [""]), 1):
+        for i, (remote_path, url) in enumerate(zip(REMOTE_PATHS, URLS + ["", ""]), 1):
             filename = f"{i}.txt"
             
             # Формируем ссылку на raw-файл в репозитории
@@ -204,9 +207,11 @@ def update_readme_table():
             if i <= 25:
                 source_name = extract_source_name(url)
                 source_column = f"[{source_name}]({url})"
-            else:
-                # Для 26-го файла создаем ссылку на сам файл с текстом "Обход SNI белых списков"
+            elif i == 26:
                 source_name = "Обход SNI белых списков"
+                source_column = f"[{source_name}]({raw_file_url})"
+            else:  # i == 27
+                source_name = "Фильтр по sidr"
                 source_column = f"[{source_name}]({raw_file_url})"
             
             # Проверяем, был ли файл обновлен в этом запуске
@@ -224,7 +229,6 @@ def update_readme_table():
                     update_time = "Никогда"
                     update_date = "Никогда"
             
-            # Для всех файлов делаем ссылку на raw-файл в столбце "Файл"
             table_rows.append(f"| {i} | [`{filename}`]({raw_file_url}) | {source_column} | {update_time} | {update_date} |")
 
         new_table = table_header + "\n" + "\n".join(table_rows)
@@ -274,7 +278,6 @@ def upload_to_github(local_path, remote_path):
                         content=content,
                     )
                     log(f"🆕 Файл {remote_path} создан.")
-                    # Добавляем в обновленные файлы
                     file_index = int(remote_path.split('/')[1].split('.')[0])
                     with _UPDATED_FILES_LOCK:
                         updated_files.add(file_index)
@@ -301,7 +304,6 @@ def upload_to_github(local_path, remote_path):
                     sha=current_sha,
                 )
                 log(f"🚀 Файл {remote_path} обновлён в репозитории.")
-                # Добавляем в обновленные файлы
                 file_index = int(remote_path.split('/')[1].split('.')[0])
                 with _UPDATED_FILES_LOCK:
                     updated_files.add(file_index)
@@ -354,6 +356,43 @@ def download_and_save(idx):
             short_msg = short_msg[:200] + "…"
         log(f"⚠️ Ошибка при скачивании {url}: {short_msg}")
         return None
+
+def extract_host_port(line: str):
+    """Пробует извлечь host и port из строки конфига."""
+    if not line:
+        return None
+
+    # vmess://<base64>
+    try:
+        if line.lower().startswith("vmess://"):
+            payload = line[len("vmess://"):]
+            try:
+                payload_bytes = base64.b64decode(payload + '=' * (-len(payload) % 4))
+                decoded = payload_bytes.decode('utf-8', errors='ignore')
+                j = json.loads(decoded)
+                host = j.get('add') or j.get('host') or j.get('ip')
+                port = j.get('port')
+                if host and port:
+                    return host, str(port)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Попытка распарсить как URI
+    try:
+        parsed = urllib.parse.urlparse(line if '://' in line else '//' + line)
+        if parsed.hostname and parsed.port:
+            return parsed.hostname, str(parsed.port)
+    except Exception:
+        pass
+
+    # Ищем явное вхождение host:port или ip:port
+    m = re.search(r'(?P<host>(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9\-_.]+):(?P<port>\d{1,5})', line)
+    if m:
+        return m.group('host'), m.group('port')
+
+    return None
 
 def create_filtered_configs():
     """Создает 26-й файл с конфигами, содержащими указанные SNI домены"""
@@ -445,7 +484,7 @@ def create_filtered_configs():
         "payment-widget.plus.kinopoisk.ru",
         "api.events.plus.yandex.net",
         "tns-counter.ru",
-        "speller.yandex.net",
+        "speller.yandx.net",
         "widgets.cbonds.ru",
         "www.magnit.com",
         "magnit-ru.injector.3ebra.net",
@@ -515,7 +554,6 @@ def create_filtered_configs():
     
     all_configs = []
 
-    # Читаем все 25 файлов и собираем конфиги, содержащие указанные домены
     for i in range(1, 26):
         local_path = f"githubmirror/{i}.txt"
         if os.path.exists(local_path):
@@ -528,74 +566,25 @@ def create_filtered_configs():
             except Exception as e:
                 log(f"⚠️ Ошибка при чтении файла {local_path}: {e}")
 
-    def _extract_host_port(line: str):
-        """Пробует извлечь host и port из строки конфига.
-        Поддерживает несколько форматов: vmess://<base64-json>, обычные URI с схемой,
-        а также простые вхождения host:port или ip:port через regex.
-        Возвращает кортеж (host, port) или None.
-        """
-        if not line:
-            return None
-
-        # vmess://<base64>
-        try:
-            if line.lower().startswith("vmess://"):
-                payload = line[len("vmess://"):]
-                # корректируем паддинг и декодируем
-                try:
-                    payload_bytes = base64.b64decode(payload + '=' * (-len(payload) % 4))
-                    decoded = payload_bytes.decode('utf-8', errors='ignore')
-                    j = json.loads(decoded)
-                    host = j.get('add') or j.get('host') or j.get('ip')
-                    port = j.get('port')
-                    if host and port:
-                        return host, str(port)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Попытка распарсить как URI (trojan://, vless://, http:// и т.д.)
-        try:
-            parsed = urllib.parse.urlparse(line if '://' in line else '//' + line)
-            if parsed.hostname and parsed.port:
-                return parsed.hostname, str(parsed.port)
-        except Exception:
-            pass
-
-        # Ищем явное вхождение host:port или ip:port
-        m = re.search(r'(?P<host>(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9\-_.]+):(?P<port>\d{1,5})', line)
-        if m:
-            return m.group('host'), m.group('port')
-
-        return None
-
-    # Удаляем дубликаты: сначала проверяем полное совпадение строки, затем
-    # считаем дубликатом конфиг с тем же host:port (ip:port)
     seen_full = set()
     seen_hostport = set()
     unique_configs = []
 
     for cfg in all_configs:
         c = cfg.strip()
-        if not c:
-            continue
-
-        if c in seen_full:
+        if not c or c in seen_full:
             continue
         seen_full.add(c)
 
-        hostport = _extract_host_port(c)
+        hostport = extract_host_port(c)
         if hostport:
             key = f"{hostport[0].lower()}:{hostport[1]}"
             if key in seen_hostport:
-                # уже есть сервер с таким же host:port — считаем дубликатом
                 continue
             seen_hostport.add(key)
 
         unique_configs.append(c)
 
-    # Сохраняем в 26-й файл
     local_path_26 = "githubmirror/26.txt"
     try:
         with open(local_path_26, "w", encoding="utf-8") as file:
@@ -606,6 +595,76 @@ def create_filtered_configs():
         log(f"⚠️ Ошибка при сохранении {local_path_26}: {e}")
 
     return local_path_26
+
+def create_sidr_filtered_configs():
+    """Создает 27-й файл с конфигами, отфильтрованными по IP-диапазонам (sidr)"""
+    # Список IP-диапазонов в формате CIDR (заполните своими диапазонами)
+    cidr_ranges = [
+        # Пример: "192.168.0.0/16",
+        # Добавьте ваши IP-диапазоны здесь
+    ]
+    
+    # Преобразуем CIDR в объекты сети для быстрой проверки
+    try:
+        networks = [ipaddress.ip_network(cidr, strict=False) for cidr in cidr_ranges]
+    except ValueError as e:
+        log(f"⚠️ Ошибка в формате CIDR-диапазонов: {e}")
+        return None
+
+    all_configs = []
+
+    # Читаем все файлы (1–25) и собираем конфиги
+    for i in range(1, 26):
+        local_path = f"githubmirror/{i}.txt"
+        if os.path.exists(local_path):
+            try:
+                with open(local_path, "r", encoding="utf-8") as file:
+                    for line in file:
+                        line = line.strip()
+                        if line:
+                            all_configs.append(line)
+            except Exception as e:
+                log(f"⚠️ Ошибка при чтении файла {local_path}: {e}")
+
+    filtered_configs = []
+    seen_full = set()
+    seen_hostport = set()
+
+    for cfg in all_configs:
+        c = cfg.strip()
+        if not c or c in seen_full:
+            continue
+        seen_full.add(c)
+
+        hostport = extract_host_port(c)
+        if not hostport:
+            continue
+
+        host, port = hostport
+        key = f"{host.lower()}:{port}"
+        if key in seen_hostport:
+            continue
+        seen_hostport.add(key)
+
+        # Проверяем, является ли host IP-адресом и попадает ли он в диапазоны
+        try:
+            ip = ipaddress.ip_address(host)
+            if any(ip in network for network in networks):
+                filtered_configs.append(c)
+        except ValueError:
+            # Если host — не IP, а домен, пропускаем
+            continue
+
+    local_path_27 = "githubmirror/27.txt"
+    try:
+        with open(local_path_27, "w", encoding="utf-8") as file:
+            for config in filtered_configs:
+                file.write(config + "\n")
+        log(f"📁 Создан файл {local_path_27} с {len(filtered_configs)} конфигами, отфильтрованными по sidr")
+    except Exception as e:
+        log(f"⚠️ Ошибка при сохранении {local_path_27}: {e}")
+
+    return local_path_27
 
 def main(dry_run: bool = False):
     max_workers_download = min(DEFAULT_MAX_WORKERS, max(1, len(URLS)))
@@ -629,12 +688,17 @@ def main(dry_run: bool = False):
         for uf in concurrent.futures.as_completed(upload_futures):
             _ = uf.result()
 
-    # Создаем 26-й файл с отфильтрованными конфигами
+    # Создаем 26-й файл с отфильтрованными по SNI конфигами
     local_path_26 = create_filtered_configs()
     
-    # Загружаем 26-й файл в GitHub
+    # Создаем 27-й файл с отфильтрованными по sidr конфигами
+    local_path_27 = create_sidr_filtered_configs()
+    
+    # Загружаем 26-й и 27-й файлы в GitHub
     if not dry_run:
         upload_to_github(local_path_26, "githubmirror/26.txt")
+        if local_path_27:
+            upload_to_github(local_path_27, "githubmirror/27.txt")
 
     # Обновляем таблицу в README.md после всех загрузок
     if not dry_run and updated_files:
