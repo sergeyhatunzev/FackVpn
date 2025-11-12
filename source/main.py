@@ -1,5 +1,4 @@
 import os
-import sys
 import requests
 import urllib.parse
 import urllib3
@@ -13,17 +12,9 @@ import re
 import json
 import base64
 import ipaddress
-import bisect
-import time
-import math
 from collections import defaultdict
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-# Отключаем буферизацию вывода для реального времени в CI
-sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
-if sys.stderr:
-    sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
 # -------------------- ЛОГИРОВАНИЕ --------------------
 LOGS_BY_FILE: dict[int, list[str]] = defaultdict(list)
@@ -765,16 +756,15 @@ def create_cidr_filtered_configs():
         "217.28.224.0/20"
     ]
     
-    # --- подготовка CIDR-интервалов (int start/end) ---
-    cidr_nets = []
+    cidrs = []
     for cidr_str in sidr_ranges:
         try:
-            net = ipaddress.ip_network(cidr_str, strict=False)
-            cidr_nets.append((int(net.network_address), int(net.broadcast_address)))
+            cidrs.append(ipaddress.ip_network(cidr_str, strict=False))
         except Exception as e:
             log(f"⚠️ Ошибка при парсинге CIDR {cidr_str}: {e}")
 
-    if not cidr_nets:
+    if not cidrs:
+        # если CIDR-диапазоны не заданы — создаём пустой файл
         local_path_27 = "githubmirror/27.txt"
         try:
             with open(local_path_27, "w", encoding="utf-8") as f:
@@ -784,205 +774,131 @@ def create_cidr_filtered_configs():
             log(f"⚠️ Ошибка при создании {local_path_27}: {e}")
         return local_path_27
 
-    # объединяем перекрывающиеся интервалы
-    cidr_nets.sort(key=lambda x: x[0])
-    merged = []
-    for s, e in cidr_nets:
-        if not merged or s > merged[-1][1] + 1:
-            merged.append([s, e])
-        else:
-            if e > merged[-1][1]:
-                merged[-1][1] = e
+    all_configs = []
+    total_files = 25
+    processed_files = 0
+    matched_count = 0
 
-    starts = [iv[0] for iv in merged]
-    ends = [iv[1] for iv in merged]
+    # для визуального прогресса в консоли и логах
+    def _format_progress(done, total):
+        pct = (done / total) * 100 if total else 100
+        bar_len = 30
+        filled = int(bar_len * done / total) if total else bar_len
+        bar = "█" * filled + "-" * (bar_len - filled)
+        return f"[{bar}] {done}/{total} ({pct:.1f}%)"
 
-    # быстрый фильтр для IPv4 (избегаем частых исключений)
-    ipv4_re = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
+    log("🔎 Начинаем сканирование файлов для SIDR (27.txt)")
 
-    # Подсчёт общего числа строк — нужен для прогресс-бара (быстрая проходка)
-    total_lines = 0
     for i in range(1, 26):
-        p = f"githubmirror/{i}.txt"
-        if os.path.exists(p):
-            try:
-                # быстрый подсчёт — читаем блоками
-                with open(p, 'r', encoding='utf-8', errors='ignore') as f:
-                    for _ in f:
-                        total_lines += 1
-            except Exception as e:
-                log(f"⚠️ Ошибка при подсчёте строк в {p}: {e}")
+        local_path = f"githubmirror/{i}.txt"
+        processed_files += 1
+        if not os.path.exists(local_path):
+            log(f"⚠️ Пропускаем {local_path}: файл не найден")
+            log(f"ℹ️ Прогресс: {_format_progress(processed_files, total_files)}")
+            continue
 
-    if total_lines == 0:
-        # нет данных — создаём пустой файл
-        local_path_27 = "githubmirror/27.txt"
         try:
-            with open(local_path_27, "w", encoding="utf-8") as f:
-                f.write("")
-            log(f"📁 Создан файл {local_path_27} (нет строк для проверки)")
-        except Exception as e:
-            log(f"⚠️ Ошибка при создании {local_path_27}: {e}")
-        return local_path_27
+            with open(local_path, "r", encoding="utf-8") as file:
+                lines = file.readlines()
 
-    # Многопоточная обработка файлов — каждый воркер обрабатывает один файл
-    max_workers = min(8, (os.cpu_count() or 4))
-    processed = 0
-    processed_lock = threading.Lock()
-
-    results_lock = threading.Lock()
-    unique_configs = []
-    global_seen_full = set()
-    global_seen_hostport = set()
-
-    start_time = time.time()
-
-    def format_progress(p, total, start_t):
-        pct = (p / total) * 100 if total else 100.0
-        elapsed = time.time() - start_t
-        speed = p / elapsed if elapsed > 0 else 0
-        eta = (total - p) / speed if speed > 0 else float('inf')
-        eta_s = f"{int(eta)}s" if math.isfinite(eta) else "?"
-        return f"{p}/{total} ({pct:.1f}%) speed={int(speed)}/s elapsed={int(elapsed)}s eta={eta_s}"
-
-    stop_event = threading.Event()
-
-    def monitor():
-        # Печатаем прогресс каждые 0.5 секунды до тех пор, пока не будет установлен stop_event
-        while not stop_event.is_set():
-            with processed_lock:
-                cur = processed
-            print('\r[SIDR] ' + format_progress(cur, total_lines, start_time), end='', flush=True)
-            time.sleep(0.5)
-
-    monitor_thread = threading.Thread(target=monitor, daemon=True)
-    monitor_thread.start()
-
-    def process_file(file_index: int):
-        local_seen_full = set()
-        local_seen_hostport = set()
-        local_matches = []
-        local_count = 0
-
-        p = f"githubmirror/{file_index}.txt"
-        try:
-            with open(p, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    local_count += 1
-
-                    # периодически отчёт в глобальный processed, чтобы снизить блокировки
-                    if local_count >= 1000:
-                        with processed_lock:
-                            nonlocal processed
-                            processed += local_count
-                        local_count = 0
-
-                    if not line:
-                        continue
-
-                    hostport = _extract_host_port(line)
-                    if not hostport:
-                        continue
+            file_total = len(lines)
+            file_matched = 0
+            # Итерируемся и обновляем прогресс каждые 250 строк или в конце
+            for idx_line, raw_line in enumerate(lines, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                hostport = _extract_host_port(line)
+                if hostport:
                     host = hostport[0]
-
-                    # только IPv4-формат
-                    if not ipv4_re.match(host):
-                        continue
-
                     try:
                         ip = ipaddress.ip_address(host)
+                        if any(ip in net for net in cidrs):
+                            all_configs.append(line)
+                            file_matched += 1
                     except Exception:
+                        # host — не IP, пропускаем
                         continue
 
-                    ip_int = int(ip)
-                    idx = bisect.bisect_right(starts, ip_int) - 1
-                    if idx < 0 or ends[idx] < ip_int:
-                        continue
+                if idx_line % 250 == 0:
+                    log(f"📄 {local_path}: обработано {idx_line}/{file_total} строк; найдено в файле {file_matched}")
 
-                    # локальная дедупликация
-                    if line in local_seen_full:
-                        continue
-                    local_seen_full.add(line)
+            matched_count += file_matched
+            log(f"📄 {local_path}: закончено. Строк прочитано: {file_total}, найдено в файле: {file_matched}")
+            log(f"ℹ️ Прогресс: {_format_progress(processed_files, total_files)}")
 
-                    hp = _extract_host_port(line)
-                    if hp:
-                        key = f"{hp[0].lower()}:{hp[1]}"
-                        if key in local_seen_hostport:
-                            continue
-                        local_seen_hostport.add(key)
-
-                    local_matches.append(line)
-        except FileNotFoundError:
-            return []
         except Exception as e:
-            log(f"⚠️ Ошибка при обработке {p}: {e}")
-            return []
+            log(f"⚠️ Ошибка при чтении файла {local_path}: {e}")
+            log(f"ℹ️ Прогресс: {_format_progress(processed_files, total_files)}")
 
-        # Добавляем остаток локального счётчика
-        if local_count > 0:
-            with processed_lock:
-                nonlocal processed
-                processed += local_count
 
-        # Слияние локальных результатов в глобальные множества под блокировкой
-        with results_lock:
-            for c in local_matches:
-                if c in global_seen_full:
-                    continue
-                hp = _extract_host_port(c)
-                if hp:
-                    key = f"{hp[0].lower()}:{hp[1]}"
-                    if key in global_seen_hostport:
-                        continue
-                    global_seen_hostport.add(key)
-                global_seen_full.add(c)
+    # Удаляем дубликаты аналогично 26-му, с прогресс-баром и подробным логированием
+    log("🧹 Начинаем удаление дубликатов и нормализацию (host:port)")
+    seen_full = set()
+    seen_hostport = set()
+    unique_configs = []
+
+    total_candidates = len(all_configs)
+    processed_candidates = 0
+    last_log = 0
+
+    for cfg in all_configs:
+        processed_candidates += 1
+        c = cfg.strip()
+        if not c:
+            continue
+
+        if c in seen_full:
+            # дубликат полной строки
+            pass
+        else:
+            seen_full.add(c)
+            hostport = _extract_host_port(c)
+            if hostport:
+                key = f"{hostport[0].lower()}:{hostport[1]}"
+                if key in seen_hostport:
+                    # уже есть сервер с таким же host:port — считаем дубликатом
+                    pass
+                else:
+                    seen_hostport.add(key)
+                    unique_configs.append(c)
+            else:
+                # Не удалось извлечь host:port — сохраняем как уникальное (по полной строке)
                 unique_configs.append(c)
 
-        return []
+        # Логируем прогресс каждые 500 кандидатов или в конце
+        if processed_candidates - last_log >= 500 or processed_candidates == total_candidates:
+            last_log = processed_candidates
+            pct = (processed_candidates / total_candidates) * 100 if total_candidates else 100
+            log(f"🧾 Дедупликация: {processed_candidates}/{total_candidates} ({pct:.1f}%) обработано; уникальных пока: {len(unique_configs)}")
 
-    # Запускаем воркеры
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(process_file, i) for i in range(1, 26)]
-        # ждём завершения
-        for fut in concurrent.futures.as_completed(futures):
-            try:
-                fut.result()
-            except Exception as e:
-                log(f"⚠️ Ошибка в worker: {e}")
+    log(f"🧹 Удаление дубликатов завершено. Всего кандидатов: {total_candidates}, итоговых уникальных: {len(unique_configs)}")
 
-    # Останавливаем монитор и печатаем финальный прогресс
-    stop_event.set()
-    monitor_thread.join(timeout=2)
-    with processed_lock:
-        cur = processed
-    print('\r[SIDR] ' + format_progress(cur, total_lines, start_time))
-
-    # Записываем результаты
     local_path_27 = "githubmirror/27.txt"
     try:
         with open(local_path_27, "w", encoding="utf-8") as file:
-            for config in unique_configs:
+            for idx, config in enumerate(unique_configs, start=1):
                 file.write(config + "\n")
-        log(f"📁 Создан файл {local_path_27} с {len(unique_configs)} конфигами, попавшими в CIDR-диапазоны (проверено строк: {processed})")
+                # Периодическое логирование записи в файл (каждые 1000 записей)
+                if idx % 1000 == 0:
+                    log(f"💾 Записано {idx}/{len(unique_configs)} в {local_path_27}")
+
+        log(f"📁 Создан файл {local_path_27} с {len(unique_configs)} конфигами, попавшими в CIDR-диапазоны")
     except Exception as e:
         log(f"⚠️ Ошибка при сохранении {local_path_27}: {e}")
 
     return local_path_27
 
 def main(dry_run: bool = False):
-    print("[CHECKPOINT] Начало работы main()...", flush=True)
     max_workers_download = min(DEFAULT_MAX_WORKERS, max(1, len(URLS)))
     max_workers_upload = max(2, min(6, len(URLS)))
-    print(f"[CHECKPOINT] Стартуем с {max_workers_download} воркерами на загрузку, {max_workers_upload} на upload", flush=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_download) as download_pool, \
          concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_upload) as upload_pool:
 
-        print("[CHECKPOINT] Создаём futures для всех 25 URL...", flush=True)
         download_futures = [download_pool.submit(download_and_save, i) for i in range(len(URLS))]
         upload_futures: list[concurrent.futures.Future] = []
 
-        print("[CHECKPOINT] Ожидаем завершения загрузок...", flush=True)
         for future in concurrent.futures.as_completed(download_futures):
             result = future.result()
             if result:
@@ -991,40 +907,24 @@ def main(dry_run: bool = False):
                     log(f"ℹ️ Dry-run: пропускаем загрузку {remote_path} (локальный путь {local_path})")
                 else:
                     upload_futures.append(upload_pool.submit(upload_to_github, local_path, remote_path))
-        print(f"[CHECKPOINT] Все загрузки завершены. Очередь на upload: {len(upload_futures)} файлов", flush=True)
 
-        print("[CHECKPOINT] Ожидаем завершения uploads в GitHub...", flush=True)
         for uf in concurrent.futures.as_completed(upload_futures):
             _ = uf.result()
-        print("[CHECKPOINT] Все uploads завершены", flush=True)
 
     # Создаем 26-й файл с отфильтрованными конфигами
-    print("[CHECKPOINT] Начинаем создание 26-го файла (SNI)...", flush=True)
     local_path_26 = create_filtered_configs()
-    print("[CHECKPOINT] 26-й файл создан", flush=True)
     
     # Создаем 27-й файл (CIDR/SIDR)
-    print("[CHECKPOINT] Начинаем создание 27-го файла (SIDR)...", flush=True)
     local_path_27 = create_cidr_filtered_configs()
-    print("[CHECKPOINT] 27-й файл создан", flush=True)
 
     # Загружаем 26-й и 27-й файлы в GitHub
     if not dry_run:
-        print("[CHECKPOINT] Загружаем 26-й файл в GitHub...", flush=True)
         upload_to_github(local_path_26, "githubmirror/26.txt")
-        print("[CHECKPOINT] 26-й файл загружен", flush=True)
-        
-        print("[CHECKPOINT] Загружаем 27-й файл в GitHub...", flush=True)
         upload_to_github(local_path_27, "githubmirror/27.txt")
-        print("[CHECKPOINT] 27-й файл загружен", flush=True)
 
     # Обновляем таблицу в README.md после всех загрузок
     if not dry_run and updated_files:
-        print("[CHECKPOINT] Обновляем README.md таблицу...", flush=True)
         update_readme_table()
-        print("[CHECKPOINT] README.md обновлен", flush=True)
-    else:
-        print(f"[CHECKPOINT] Пропускаем обновление README (dry_run={dry_run}, updated_files={len(updated_files)})", flush=True)
 
     # Вывод логов
     ordered_keys = sorted(k for k in LOGS_BY_FILE.keys() if k != 0)
