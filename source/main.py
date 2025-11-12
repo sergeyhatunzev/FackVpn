@@ -13,6 +13,7 @@ import re
 import json
 import base64
 import ipaddress
+import bisect
 from collections import defaultdict
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -762,14 +763,18 @@ def create_cidr_filtered_configs():
         "217.28.224.0/20"
     ]
     
-    cidrs = []
+    # Преобразуем CIDR в отсортированные несвязанные интервалы (int start, int end)
+    cidr_nets = []
     for cidr_str in sidr_ranges:
         try:
-            cidrs.append(ipaddress.ip_network(cidr_str, strict=False))
+            net = ipaddress.ip_network(cidr_str, strict=False)
+            start = int(net.network_address)
+            end = int(net.broadcast_address)
+            cidr_nets.append((start, end))
         except Exception as e:
             log(f"⚠️ Ошибка при парсинге CIDR {cidr_str}: {e}")
 
-    if not cidrs:
+    if not cidr_nets:
         # если CIDR-диапазоны не заданы — создаём пустой файл
         local_path_27 = "githubmirror/27.txt"
         try:
@@ -780,56 +785,90 @@ def create_cidr_filtered_configs():
             log(f"⚠️ Ошибка при создании {local_path_27}: {e}")
         return local_path_27
 
-    all_configs = []
+    # Сливаем перекрывающиеся интерваллы и сортируем по началу
+    cidr_nets.sort(key=lambda x: x[0])
+    merged = []
+    for s, e in cidr_nets:
+        if not merged or s > merged[-1][1] + 1:
+            merged.append([s, e])
+        else:
+            if e > merged[-1][1]:
+                merged[-1][1] = e
+
+    starts = [iv[0] for iv in merged]
+    ends = [iv[1] for iv in merged]
+
+    # Регулярка для быстрого опознавания IPv4 — избегаем дорогостоящих исключений
+    ipv4_re = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
+
+    seen_full = set()
+    seen_hostport = set()
+    unique_configs = []
+
+    total_checked = 0
+    matches_found = 0
+
     for i in range(1, 26):
         local_path = f"githubmirror/{i}.txt"
         if os.path.exists(local_path):
             try:
                 with open(local_path, "r", encoding="utf-8") as file:
                     for line in file:
+                        total_checked += 1
+                        if total_checked % 10000 == 0:
+                            log(f"🔎 Проверено строк: {total_checked}, найдено совпадений: {matches_found}")
+
                         line = line.strip()
                         if not line:
                             continue
+
                         hostport = _extract_host_port(line)
-                        if hostport:
-                            host = hostport[0]
-                            # пробуем распарсить как IP, иначе попробуем резолв (но резолв не делаем — только IP)
-                            try:
-                                ip = ipaddress.ip_address(host)
-                                if any(ip in net for net in cidrs):
-                                    all_configs.append(line)
-                            except Exception:
-                                # host — не IP, пропускаем (у нас SIDR — по IP-диапазонам)
+                        if not hostport:
+                            continue
+
+                        host = hostport[0]
+
+                        # Сначала быстрый фильтр по форме IPv4
+                        if not ipv4_re.match(host):
+                            continue
+
+                        try:
+                            ip = ipaddress.ip_address(host)
+                        except Exception:
+                            # если всё же невалидный IP — пропускаем
+                            continue
+
+                        ip_int = int(ip)
+
+                        # Бинарный поиск по интервалам
+                        idx = bisect.bisect_right(starts, ip_int) - 1
+                        if idx < 0 or ends[idx] < ip_int:
+                            continue
+
+                        # Попадание в диапазон — учитываем и делаем дедуп
+                        c = line
+                        if c in seen_full:
+                            continue
+                        seen_full.add(c)
+
+                        hp = _extract_host_port(c)
+                        if hp:
+                            key = f"{hp[0].lower()}:{hp[1]}"
+                            if key in seen_hostport:
                                 continue
+                            seen_hostport.add(key)
+
+                        unique_configs.append(c)
+                        matches_found += 1
             except Exception as e:
                 log(f"⚠️ Ошибка при чтении файла {local_path}: {e}")
-
-    # Удаляем дубликаты аналогично 26-му
-    seen_full = set()
-    seen_hostport = set()
-    unique_configs = []
-
-    for cfg in all_configs:
-        c = cfg.strip()
-        if not c:
-            continue
-        if c in seen_full:
-            continue
-        seen_full.add(c)
-        hostport = _extract_host_port(c)
-        if hostport:
-            key = f"{hostport[0].lower()}:{hostport[1]}"
-            if key in seen_hostport:
-                continue
-            seen_hostport.add(key)
-        unique_configs.append(c)
 
     local_path_27 = "githubmirror/27.txt"
     try:
         with open(local_path_27, "w", encoding="utf-8") as file:
             for config in unique_configs:
                 file.write(config + "\n")
-        log(f"📁 Создан файл {local_path_27} с {len(unique_configs)} конфигами, попавшими в CIDR-диапазоны")
+        log(f"📁 Создан файл {local_path_27} с {len(unique_configs)} конфигами, попавшими в CIDR-диапазоны (проверено строк: {total_checked})")
     except Exception as e:
         log(f"⚠️ Ошибка при сохранении {local_path_27}: {e}")
 
