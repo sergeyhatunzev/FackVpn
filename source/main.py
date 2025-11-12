@@ -844,22 +844,38 @@ def create_cidr_filtered_configs():
         eta_s = f"{int(eta)}s" if math.isfinite(eta) else "?"
         return f"{p}/{total} ({pct:.1f}%) speed={int(speed)}/s elapsed={int(elapsed)}s eta={eta_s}"
 
+    stop_event = threading.Event()
+
+    def monitor():
+        # Печатаем прогресс каждые 0.5 секунды до тех пор, пока не будет установлен stop_event
+        while not stop_event.is_set():
+            with processed_lock:
+                cur = processed
+            print('\r[SIDR] ' + format_progress(cur, total_lines, start_time), end='', flush=True)
+            time.sleep(0.5)
+
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    monitor_thread.start()
+
     def process_file(file_index: int):
-        nonlocal processed
         local_seen_full = set()
         local_seen_hostport = set()
         local_matches = []
+        local_count = 0
 
         p = f"githubmirror/{file_index}.txt"
         try:
             with open(p, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
                     line = line.strip()
-                    with processed_lock:
-                        processed += 1
-                        if processed % 5000 == 0 or processed == total_lines:
-                            # печатаем прогресс поверх строки
-                            print('\r[SIDR] ' + format_progress(processed, total_lines, start_time), end='', flush=True)
+                    local_count += 1
+
+                    # периодически отчёт в глобальный processed, чтобы снизить блокировки
+                    if local_count >= 1000:
+                        with processed_lock:
+                            nonlocal processed
+                            processed += local_count
+                        local_count = 0
 
                     if not line:
                         continue
@@ -902,6 +918,12 @@ def create_cidr_filtered_configs():
             log(f"⚠️ Ошибка при обработке {p}: {e}")
             return []
 
+        # Добавляем остаток локального счётчика
+        if local_count > 0:
+            with processed_lock:
+                nonlocal processed
+                processed += local_count
+
         # Слияние локальных результатов в глобальные множества под блокировкой
         with results_lock:
             for c in local_matches:
@@ -921,15 +943,19 @@ def create_cidr_filtered_configs():
     # Запускаем воркеры
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(process_file, i) for i in range(1, 26)]
-        # ждём завершения и печатаем завершающий прогресс
+        # ждём завершения
         for fut in concurrent.futures.as_completed(futures):
             try:
                 fut.result()
             except Exception as e:
                 log(f"⚠️ Ошибка в worker: {e}")
 
-    # Финальный прогресс-вывод
-    print('\r[SIDR] ' + format_progress(processed, total_lines, start_time))
+    # Останавливаем монитор и печатаем финальный прогресс
+    stop_event.set()
+    monitor_thread.join(timeout=2)
+    with processed_lock:
+        cur = processed
+    print('\r[SIDR] ' + format_progress(cur, total_lines, start_time))
 
     # Записываем результаты
     local_path_27 = "githubmirror/27.txt"
