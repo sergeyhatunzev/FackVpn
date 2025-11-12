@@ -817,8 +817,13 @@ def create_cidr_filtered_configs():
     update_interval = 0.5
     update_lines = 200
 
+    # Быстрый регекс для проверки, является ли host IPv4 (чтобы не вызывать ipaddress.ip_address для доменов)
+    ip_host_re = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
+
     for file_idx, path, cnt in files_to_scan:
         try:
+            file_start = time.time()
+            log(f"githubmirror/27.txt — 🔎 Начинаем сканирование файла {path} ({cnt} строк), индекс {file_idx}")
             with open(path, "r", encoding="utf-8") as file:
                 for line in file:
                     processed += 1
@@ -828,13 +833,17 @@ def create_cidr_filtered_configs():
                     hostport = _extract_host_port(line)
                     if hostport:
                         host = hostport[0]
+                        # Быстро пропускаем, если host — не IP (чёткая и быстрая проверка)
+                        if not ip_host_re.match(host):
+                            # host — домен/hostname, пропускаем (не IP)
+                            continue
                         try:
                             ip = ipaddress.ip_address(host)
                             if any(ip in net for net in cidrs):
                                 all_configs.append(line)
                                 matches += 1
                         except Exception:
-                            # host — не IP, пропускаем
+                            # необычный случай — пропускаем
                             pass
 
                     # Обновляем прогресс-бар
@@ -853,6 +862,13 @@ def create_cidr_filtered_configs():
             if len(short_msg) > 200:
                 short_msg = short_msg[:200] + "…"
             log(f"githubmirror/27.txt — ⚠️ Ошибка при чтении файла {path}: {short_msg}")
+        finally:
+            # Логируем время обработки файла
+            try:
+                file_elapsed = time.time() - file_start
+                log(f"githubmirror/27.txt — ✅ Завершено сканирование {path}: обработано {cnt} строк за {file_elapsed:.1f}s, найдено пока={matches}")
+            except Exception:
+                pass
 
     # Финальный прогресс
     print()  # перенос строки после прогресс-бара
